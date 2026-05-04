@@ -1,6 +1,8 @@
-# lvm
+# lvm — Sandboxed Linux VMs for Claude Code on macOS
 
-A wrapper around [Lima](https://github.com/lima-vm/lima) for running isolated Linux VMs scoped to specific directories. Designed for running Claude Code in total isolation — no access to your home directory, SSH keys, or anything outside the project folder.
+Run [Claude Code](https://docs.anthropic.com/en/docs/claude-code) in fully isolated Linux VMs, one per project. Built on [Lima](https://github.com/lima-vm/lima) and Apple's Virtualization.framework.
+
+Each VM mounts only the project directory you specify — no access to your home directory, SSH keys, AWS credentials, or anything outside the project folder. Ideal for secure AI-assisted development where you want Claude to write and run code without exposing your host system.
 
 ## How it works
 
