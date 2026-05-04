@@ -1,0 +1,33 @@
+# Lima VM template for lvm
+# Only the target project directory is mounted — no host home, no secrets.
+
+vmType: "vz"
+mountType: "virtiofs"
+
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img"
+    arch: "x86_64"
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+
+cpus: 4
+memory: "8GiB"
+disk: "20GiB"
+
+mounts:
+  - location: "__MOUNT_PATH__"
+    writable: true
+
+portForwards: []
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+      apt-get update
+      apt-get install -y git curl build-essential
+      curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+      apt-get install -y nodejs
+      corepack enable
+      npm install -g @anthropic-ai/claude-code

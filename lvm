@@ -1,0 +1,319 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TEMPLATE="$SCRIPT_DIR/template.yaml"
+CONFIG_DIR="$HOME/.lima/_lvm"
+
+# --- helpers ---
+
+require_lima() {
+    if ! command -v limactl &>/dev/null; then
+        echo "Error: lima is not installed. Install with: brew install lima"
+        exit 1
+    fi
+}
+
+vm_exists() {
+    limactl list -q 2>/dev/null | grep -qx "$1"
+}
+
+require_vm() {
+    local name="${1:?Usage: lvm $CMD <name>}"
+    if ! vm_exists "$name"; then
+        echo "Error: VM '$name' not found. Run 'lvm list' to see instances."
+        exit 1
+    fi
+}
+
+# Read the mount path back from the generated config.
+get_workdir() {
+    local config="$CONFIG_DIR/${1}.yaml"
+    if [ -f "$config" ]; then
+        sed -n 's/^.*location: *"\?\([^"]*\)"\?$/\1/p' "$config" | head -1
+    fi
+}
+
+# --- commands ---
+
+cmd_create() {
+    local name="${1:?Usage: lvm create <name>}"
+    local dir="$(pwd)"
+
+    if vm_exists "$name"; then
+        echo "Error: VM '$name' already exists."
+        exit 1
+    fi
+
+    # Generate CLAUDE.md if it doesn't already exist
+    if [ ! -f "$dir/CLAUDE.md" ]; then
+        cat > "$dir/CLAUDE.md" <<EOF
+# Environment
+
+You are running inside an isolated Linux VM (Lima). Only this directory is mounted and writable:
+
+    $dir
+
+Do not attempt to create, read, or modify files outside this directory — they do not exist.
+Any tools, packages, or configuration installed outside this directory (e.g. in /usr, ~/.config)
+will be lost if the VM is recreated.
+
+## Available tools
+
+- **Node.js 22** and **npm**
+- **yarn** (via corepack)
+- **git** (no credentials configured — no SSH keys or git user/email are available)
+- **build-essential** (gcc, g++, make)
+- **curl**
+
+You can use these freely. If you need additional packages, install them with \`sudo apt-get install <package>\`,
+but note they will be lost if the VM is recreated.
+EOF
+        echo "Created CLAUDE.md in $dir"
+    fi
+
+    echo "Creating VM '$name' for $dir..."
+    mkdir -p "$CONFIG_DIR"
+    local config="$CONFIG_DIR/${name}.yaml"
+    sed "s|__MOUNT_PATH__|${dir}|g" "$TEMPLATE" > "$config"
+    limactl start --name="$name" "$config"
+    echo "VM '$name' is running."
+}
+
+cmd_start() {
+    local name="${1:?Usage: lvm start <name>}"
+    require_vm "$name"
+    limactl start "$name"
+    echo "VM '$name' started."
+}
+
+cmd_shell() {
+    local name="${1:?Usage: lvm shell <name>}"
+    require_vm "$name"
+    shift
+    local workdir
+    workdir="$(get_workdir "$name")"
+
+    if [ $# -gt 0 ]; then
+        limactl shell ${workdir:+--workdir "$workdir"} "$name" "$@"
+    else
+        limactl shell ${workdir:+--workdir "$workdir"} "$name"
+    fi
+}
+
+cmd_claude() {
+    local name="${1:?Usage: lvm claude <name>}"
+    require_vm "$name"
+    shift
+    local workdir
+    workdir="$(get_workdir "$name")"
+
+    read -rp "Run Claude in dangerously-skip-permissions mode? [Y/n] " answer
+    case "${answer:-Y}" in
+        [Yy]*) set -- --dangerously-skip-permissions "$@" ;;
+    esac
+
+    limactl shell ${workdir:+--workdir "$workdir"} "$name" claude "$@"
+}
+
+cmd_stop() {
+    local name="${1:?Usage: lvm stop <name>}"
+    require_vm "$name"
+    shift
+    limactl stop "$@" "$name" 2>/dev/null || echo "VM '$name' is already stopped."
+}
+
+cmd_port_forward() {
+    local name="${1:?Usage: lvm port-forward <name> <guestPort> [hostPort]}"
+    local guest="${2:?Usage: lvm port-forward <name> <guestPort> [hostPort]}"
+    local host="${3:-$guest}"
+    require_vm "$name"
+
+    local was_running=false
+    if limactl list -f '{{.Status}}' "$name" 2>/dev/null | grep -qi running; then
+        was_running=true
+        echo "Stopping '$name' to update config..."
+        limactl stop "$name"
+    fi
+
+    echo "Adding port forward: host:$host -> $name:$guest"
+    limactl edit --set ".portForwards += [{\"guestPort\": $guest, \"hostPort\": $host}]" "$name"
+
+    if $was_running; then
+        echo "Starting '$name'..."
+        limactl start "$name"
+    fi
+}
+
+cmd_stop_all() {
+    local stopped=0
+    local exclude="${1:-}"
+    for config in "$CONFIG_DIR"/*.yaml; do
+        [ -f "$config" ] || continue
+        local name
+        name="$(basename "$config" .yaml)"
+        [ "$name" = "$exclude" ] && continue
+        if vm_exists "$name"; then
+            echo "Stopping '$name'..."
+            limactl stop "$name" 2>/dev/null && stopped=$((stopped + 1)) || true
+        fi
+    done
+    echo "Stopped $stopped VM(s)."
+}
+
+cmd_rename() {
+    local old="${1:?Usage: lvm rename <old-name> <new-name>}"
+    local new="${2:?Usage: lvm rename <old-name> <new-name>}"
+    require_vm "$old"
+
+    if [ -d "$HOME/.lima/$new" ]; then
+        echo "Error: '$new' already exists."
+        exit 1
+    fi
+
+    echo "Stopping VM '$old'..."
+    limactl stop "$old" 2>/dev/null || true
+    mv "$HOME/.lima/$old" "$HOME/.lima/$new"
+    [ -f "$CONFIG_DIR/${old}.yaml" ] && mv "$CONFIG_DIR/${old}.yaml" "$CONFIG_DIR/${new}.yaml"
+    echo "Renamed '$old' -> '$new'. Run 'lvm start $new' to start it."
+}
+
+cmd_provision() {
+    local name="${1:?Usage: lvm provision <name>}"
+    require_vm "$name"
+
+    # Extract the provision script from the template
+    local script
+    script="$(sed -n '/^ *script: |/,/^[^ ]/{ /^ *script: |/d; /^[^ ]/d; s/^      //p; }' "$TEMPLATE")"
+
+    if [ -z "$script" ]; then
+        echo "Error: could not extract provision script from template."
+        exit 1
+    fi
+
+    echo "Running provision script on '$name'..."
+    limactl shell "$name" -- sudo bash -c "$script"
+    echo "Provision complete."
+}
+
+cmd_rm() {
+    local name="${1:?Usage: lvm rm <name>}"
+    require_vm "$name"
+    limactl delete --force "$name"
+    rm -f "$CONFIG_DIR/${name}.yaml"
+    echo "VM '$name' removed."
+}
+
+cmd_list() {
+    if [ ! -d "$CONFIG_DIR" ] || ! ls "$CONFIG_DIR"/*.yaml &>/dev/null; then
+        echo "No lvm instances."
+        return
+    fi
+    printf "%-20s %s\n" "NAME" "DIR"
+    for config in "$CONFIG_DIR"/*.yaml; do
+        local name dir
+        name="$(basename "$config" .yaml)"
+        dir="$(get_workdir "$name")"
+        printf "%-20s %s\n" "$name" "$dir"
+    done
+    echo ""
+    limactl list 2>/dev/null
+}
+
+cmd_completions() {
+    cat <<'COMP'
+#compdef lvm
+
+_lvm() {
+    local -a commands
+    commands=(
+        'create:Create a VM for the current directory'
+        'start:Start a stopped VM'
+        'shell:Open a shell in the VM'
+        'claude:Run Claude Code in the VM'
+        'stop:Stop the VM'
+        'stop-all:Stop all running VMs'
+        'stop-except:Stop all running VMs except one'
+        'port-forward:Forward a VM port to the host'
+        'provision:Re-run provision script on a VM'
+        'rename:Rename a VM'
+        'rm:Stop and remove the VM'
+        'list:List lvm instances'
+        'help:Show help'
+        'completions:Print shell completions'
+    )
+
+    _lvm_names() {
+        local -a names
+        local config_dir="$HOME/.lima/_lvm"
+        if [ -d "$config_dir" ]; then
+            for f in "$config_dir"/*.yaml(N); do
+                names+=("${${f:t}%.yaml}")
+            done
+        fi
+        _describe 'vm name' names
+    }
+
+    if (( CURRENT == 2 )); then
+        _describe 'command' commands
+    elif (( CURRENT == 3 )); then
+        case "$words[2]" in
+            start|shell|claude|stop|stop-except|port-forward|provision|rm|rename)
+                _lvm_names
+                ;;
+        esac
+    elif (( CURRENT == 4 )); then
+        case "$words[2]" in
+            rename) _lvm_names ;;
+        esac
+    fi
+}
+
+_lvm "$@"
+COMP
+}
+
+cmd_help() {
+    cat <<'EOF'
+Usage: lvm <command> <name> [args...]
+
+Commands:
+  create <name>                            Create a VM for the current directory
+  start <name>                             Start a stopped VM
+  shell <name> [cmd...]                    Open a shell (or run a command) in the VM
+  claude <name> [args..]                   Run Claude Code in the VM
+  stop <name>                              Stop the VM
+  stop-all                                 Stop all running VMs
+  stop-except <name>                       Stop all running VMs except <name>
+  port-forward <name> <guest> [host]       Forward host:<host> -> VM:<guest> permanently
+  provision <name>                         Re-run provision script on a VM
+  rename <old> <new>                       Rename a VM (stops it first)
+  rm <name>                                Stop and remove the VM
+  list                                     List lvm instances
+  completions                              Print zsh completions (eval or source)
+  help                                     Show this help
+EOF
+}
+
+# --- main ---
+
+require_lima
+CMD="${1:-help}"
+shift || true
+
+case "$CMD" in
+    create)       cmd_create "$@" ;;
+    start)        cmd_start "$@" ;;
+    shell)        cmd_shell "$@" ;;
+    claude)       cmd_claude "$@" ;;
+    stop)         cmd_stop "$@" ;;
+    stop-all)     cmd_stop_all ;;
+    stop-except)  cmd_stop_all "$@" ;;
+    port-forward) cmd_port_forward "$@" ;;
+    provision)    cmd_provision "$@" ;;
+    rename)       cmd_rename "$@" ;;
+    rm)           cmd_rm "$@" ;;
+    list)         cmd_list ;;
+    completions)  cmd_completions ;;
+    help|*)       cmd_help ;;
+esac
